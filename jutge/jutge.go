@@ -1,10 +1,4 @@
-// Package jutge is the library behind the jutge command line:
-// the HTTP client, request shaping, and the typed data models for jutge.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Package jutge scrapes the Jutge.org problem archive.
 package jutge
 
 import (
@@ -12,103 +6,135 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to jutge. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "jutge/dev (+https://github.com/tamnd/jutge-cli)"
-
-// Client talks to jutge over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config controls the HTTP client behaviour.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://jutge.org",
+		Rate:      500 * time.Millisecond,
+		Timeout:   60 * time.Second,
+		Retries:   3,
+		UserAgent: "jutge-cli/0.1 (github.com/tamnd/jutge-cli)",
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+// Client fetches Jutge data.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient creates a Client from cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+var problemRe = regexp.MustCompile(`href='/problems/([A-Z]\d+)_en'>[A-Z]\d+</a>\s*&nbsp;\s*([^\n<]+)`)
+
+// ListProblems fetches all English problems from the Jutge problem list page.
+func (c *Client) ListProblems(ctx context.Context, limit int) ([]Problem, error) {
+	body, err := c.fetch(ctx, "/problems")
+	if err != nil {
+		return nil, err
+	}
+	matches := problemRe.FindAllStringSubmatch(string(body), -1)
+	var problems []Problem
+	for i, m := range matches {
+		if limit > 0 && i >= limit {
+			break
+		}
+		code := m[1]
+		title := strings.TrimSpace(m[2])
+		problems = append(problems, Problem{
+			Rank:  i + 1,
+			Code:  code,
+			Title: title,
+			URL:   fmt.Sprintf("%s/problems/%s_en", c.cfg.BaseURL, code),
+		})
+	}
+	return problems, nil
+}
+
+// Search returns problems whose title or code contains query (case-insensitive).
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Problem, error) {
+	all, err := c.ListProblems(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var out []Problem
+	for _, p := range all {
+		if strings.Contains(strings.ToLower(p.Title), q) || strings.Contains(strings.ToLower(p.Code), q) {
+			out = append(out, p)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	for i := range out {
+		out[i].Rank = i + 1
+	}
+	return out, nil
+}
+
+func (c *Client) fetch(ctx context.Context, path string) ([]byte, error) {
+	url := c.cfg.BaseURL + path
+	var last error
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(time.Duration(attempt) * time.Second):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			last = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		}
+		return io.ReadAll(resp.Body)
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("all retries failed for %s: %w", url, last)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
-}
-
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
 }

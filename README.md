@@ -1,10 +1,8 @@
 # jutge
 
-A command line for jutge.
+Browse and search the [Jutge.org](https://jutge.org) competitive programming problem archive from the command line.
 
-`jutge` is a single pure-Go binary. It speaks to jutge over plain
-HTTPS, shapes the responses into clean records, and pipes into the rest of your
-tools. No API key, nothing to run alongside it.
+`jutge` is a single pure-Go binary. No login or API key required.
 
 ## Install
 
@@ -12,8 +10,7 @@ tools. No API key, nothing to run alongside it.
 go install github.com/tamnd/jutge-cli/cmd/jutge@latest
 ```
 
-Or grab a prebuilt binary from the [releases](https://github.com/tamnd/jutge-cli/releases), or run
-the container image:
+Or grab a prebuilt binary from the [releases](https://github.com/tamnd/jutge-cli/releases), or run the container image:
 
 ```bash
 docker run --rm ghcr.io/tamnd/jutge:latest --help
@@ -22,41 +19,42 @@ docker run --rm ghcr.io/tamnd/jutge:latest --help
 ## Usage
 
 ```bash
-jutge --help
-jutge version
+# List all problems (4600+)
+jutge list
+
+# List first 20 problems in table format
+jutge list -n 20 -o table
+
+# Search problems by title or code
+jutge search "path"
+jutge search "shortest" -n 10
+
+# Output formats
+jutge list -o json
+jutge list -o csv -n 50
+jutge search "sort" -o jsonl
 ```
 
-This is a fresh scaffold. The command tree starts with `version`; build out the
-real commands in `cli/` on top of the `jutge` library package.
+## Commands
 
-## Development
+| Command | Description |
+|---------|-------------|
+| `list` | List all problems in the Jutge archive |
+| `search <query>` | Search problems by title or code (case-insensitive) |
+| `version` | Show version information |
+
+## Global flags
 
 ```
-cmd/jutge/   thin main, wires cli.Root into fang
-cli/                 the cobra command tree
-jutge/                the library: HTTP client and data models
-docs/                tago documentation site
+-o, --output string    output format: table|json|jsonl|csv|tsv|url|raw (default "auto")
+-n, --limit int        limit number of records (0 = all)
+    --fields strings   comma-separated columns to include
+    --no-header        omit header row
+    --template string  Go text/template per record
+    --timeout duration per-request timeout (default 1m0s)
+    --delay duration   minimum spacing between requests
+    --retries int      retry attempts on 429/5xx (default 3)
 ```
-
-```bash
-make build      # ./bin/jutge
-make test       # go test ./...
-make vet        # go vet ./...
-```
-
-## Releasing
-
-Push a version tag and GitHub Actions runs GoReleaser, which builds the
-archives, Linux packages, the multi-arch GHCR image, checksums, SBOMs, and a
-cosign signature:
-
-```bash
-git tag v0.1.0
-git push --tags
-```
-
-The Homebrew and Scoop steps self-disable until their tokens exist, so the first
-release works with no extra secrets.
 
 ## License
 
